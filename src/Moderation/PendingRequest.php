@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Prism\Moderation;
 
 use Illuminate\Http\Client\RequestException;
+use Illuminate\Support\Traits\Conditionable;
 use Prism\Prism\Concerns\ConfiguresClient;
 use Prism\Prism\Concerns\ConfiguresProviders;
 use Prism\Prism\Concerns\HasProviderOptions;
@@ -13,6 +14,7 @@ use Prism\Prism\ValueObjects\Media\Image;
 
 class PendingRequest
 {
+    use Conditionable;
     use ConfiguresClient;
     use ConfiguresProviders;
     use HasProviderOptions;

@@ -8,6 +8,7 @@ use Generator;
 use Illuminate\Broadcasting\Channel;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Traits\Conditionable;
 use Prism\Prism\Concerns\ConfiguresClient;
 use Prism\Prism\Concerns\ConfiguresGeneration;
 use Prism\Prism\Concerns\ConfiguresModels;
@@ -29,6 +30,7 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class PendingRequest
 {
+    use Conditionable;
     use ConfiguresClient;
     use ConfiguresGeneration;
     use ConfiguresModels;

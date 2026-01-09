@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Prism\Audio;
 
 use Illuminate\Http\Client\RequestException;
+use Illuminate\Support\Traits\Conditionable;
 use InvalidArgumentException;
 use Prism\Prism\Concerns\ConfiguresClient;
 use Prism\Prism\Concerns\ConfiguresModels;
@@ -14,6 +15,7 @@ use Prism\Prism\ValueObjects\Media\Audio;
 
 class PendingRequest
 {
+    use Conditionable;
     use ConfiguresClient;
     use ConfiguresModels;
     use ConfiguresProviders;

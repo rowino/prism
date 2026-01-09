@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Prism\Structured;
 
 use Illuminate\Http\Client\RequestException;
+use Illuminate\Support\Traits\Conditionable;
 use Prism\Prism\Concerns\ConfiguresClient;
 use Prism\Prism\Concerns\ConfiguresGeneration;
 use Prism\Prism\Concerns\ConfiguresModels;
@@ -23,6 +24,7 @@ use Prism\Prism\ValueObjects\Messages\UserMessage;
 
 class PendingRequest
 {
+    use Conditionable;
     use ConfiguresClient;
     use ConfiguresGeneration;
     use ConfiguresModels;
