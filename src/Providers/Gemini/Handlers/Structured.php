@@ -105,17 +105,20 @@ class Structured
         $thinkingConfig = $providerOptions['thinkingConfig'] ?? null;
 
         if (isset($providerOptions['thinkingBudget'])) {
-            $thinkingConfig = [
+            $thinkingConfig = Arr::whereNotNull([
                 'thinkingBudget' => $providerOptions['thinkingBudget'],
-            ];
+                'includeThoughts' => $providerOptions['includeThoughts'] ?? null,
+            ]);
         }
 
         if (isset($providerOptions['thinkingLevel'])) {
-            $thinkingConfig = [
+            $thinkingConfig = Arr::whereNotNull([
                 'thinkingLevel' => $providerOptions['thinkingLevel'],
-            ];
+                'includeThoughts' => $providerOptions['includeThoughts'] ?? null,
+            ]);
         }
 
+        /** @var \Illuminate\Http\Client\Response $response */
         $response = $this->client->post(
             "{$request->model()}:generateContent",
             Arr::whereNotNull([
@@ -233,7 +236,7 @@ class Structured
                 ),
                 meta: new Meta(
                     id: data_get($data, 'id', ''),
-                    model: data_get($data, 'modelVersion'),
+                    model: data_get($data, 'modelVersion', ''),
                 ),
                 messages: $request->messages(),
                 systemPrompts: $request->systemPrompts(),

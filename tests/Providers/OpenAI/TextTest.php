@@ -567,7 +567,7 @@ it('can analyze documents', function (): void {
 it('sends reasoning effort when defined', function (): void {
     FixtureResponse::fakeResponseSequence('v1/responses', 'openai/text-reasoning-effort');
 
-    Prism::text()
+    $response = Prism::text()
         ->using('openai', 'gpt-5')
         ->withPrompt('Who are you?')
         ->withProviderOptions([
@@ -578,6 +578,10 @@ it('sends reasoning effort when defined', function (): void {
         ->asText();
 
     Http::assertSent(fn (Request $request): bool => $request->data()['reasoning']['effort'] === 'low');
+
+    expect($response->additionalContent['reasoningSummaries'])->toBe([
+        'I should introduce myself to the user.',
+    ]);
 });
 
 describe('provider tool results', function (): void {
@@ -601,6 +605,9 @@ describe('provider tool results', function (): void {
         expect($providerTool->data)->toHaveKey('action');
         expect($providerTool->data['action']['type'])->toBe('search');
         expect($providerTool->data['action']['query'])->toContain('London weather');
+
+        expect($response->steps[0]->additionalContent)->toHaveKey('searchQueries');
+        expect($response->steps[0]->additionalContent['searchQueries'])->toBe(['London weather forecast today']);
     });
 
     it('captures code interpreter provider tool in providerToolCalls', function (): void {
@@ -739,5 +746,30 @@ describe('citations', function (): void {
             ->asText();
 
         expect($responseTwo->text)->toContain('Metcheck');
+    });
+});
+
+it('passes store parameter when specified', function (): void {
+    FixtureResponse::fakeResponseSequence(
+        'v1/responses',
+        'openai/generate-text-with-a-prompt'
+    );
+
+    $store = false;
+
+    Prism::text()
+        ->using(Provider::OpenAI, 'gpt-4o')
+        ->withPrompt('Give me TLDR of this legal document')
+        ->withProviderOptions([
+            'store' => $store,
+        ])
+        ->asText();
+
+    Http::assertSent(function (Request $request) use ($store): true {
+        $body = json_decode($request->body(), true);
+
+        expect(data_get($body, 'store'))->toBe($store);
+
+        return true;
     });
 });

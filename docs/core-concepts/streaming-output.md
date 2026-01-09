@@ -254,6 +254,8 @@ All streaming approaches emit the same core events with consistent data structur
 - **`thinking_complete`** - End of reasoning session
 - **`tool_call`** - Tool invocation with arguments
 - **`tool_result`** - Tool execution results
+- **`tool_call_delta`** - Incremental tool call params chunks as they're generated
+- **`artifact`** - Binary artifacts produced by tools (images, audio, files)
 - **`provider_tool_event`** - Provider-specific tool events (e.g., image generation, web search)
 - **`error`** - Error handling with recovery information
 - **`stream_end`** - Stream completion with usage statistics
@@ -318,6 +320,24 @@ Based on actual streaming output:
     }
 }
 
+// artifact event (from tool output)
+{
+    "id": "anthropic_evt_xyz789",
+    "timestamp": 1756412891,
+    "tool_call_id": "toolu_01NAbzpjGxv2mJ8gJRX5Bb8m",
+    "tool_name": "generate_image",
+    "message_id": "msg_01BS7MKgXvUESY8yAEugphV2",
+    "artifact": {
+        "id": "img-abc123",
+        "data": "iVBORw0KGgo...", // base64 encoded data
+        "mime_type": "image/png",
+        "metadata": {
+            "width": 1024,
+            "height": 1024
+        }
+    }
+}
+
 // stream_end event
 {
     "id": "anthropic_evt_BZ3rqDYyprnywNyL",
@@ -333,82 +353,276 @@ Based on actual streaming output:
 }
 ```
 
-## Advanced Usage
+## Handling Artifact Events
 
-### Handling Stream Completion with Callbacks
+When tools produce binary artifacts (images, audio, files), they're emitted as `ArtifactEvent` through the stream. This lets your application handle binary data without it going to the LLM's context window.
 
-Need to save a conversation to your database after the AI finishes responding? The `onComplete` callback lets you handle completed messages without interrupting the stream. This is perfect for persisting conversations, tracking analytics, or logging AI interactions.
+### Artifact Events with SSE
 
+Listen for artifact events alongside other stream events:
+
+```javascript
+const eventSource = new EventSource('/chat');
+
+eventSource.addEventListener('artifact', (event) => {
+    const data = JSON.parse(event.data);
+
+    // Display an image artifact
+    if (data.artifact.mime_type.startsWith('image/')) {
+        const img = document.createElement('img');
+        img.src = `data:${data.artifact.mime_type};base64,${data.artifact.data}`;
+        document.getElementById('artifacts').appendChild(img);
+    }
+
+    // Handle other artifact types
+    console.log('Artifact received:', {
+        toolName: data.tool_name,
+        mimeType: data.artifact.mime_type,
+        metadata: data.artifact.metadata,
+    });
+});
+
+eventSource.addEventListener('text_delta', (event) => {
+    const data = JSON.parse(event.data);
+    document.getElementById('output').textContent += data.delta;
+});
+```
+
+### Artifact Events with Vercel AI SDK
+
+When using `asDataStreamResponse()`, artifacts are sent as data protocol messages with type `artifact`:
+
+```javascript
+import { useChat } from '@ai-sdk/react';
+import { useState } from 'react';
+
+export default function Chat() {
+    const [input, setInput] = useState('');
+    const [artifacts, setArtifacts] = useState([]);
+
+    const { messages, sendMessage, status, data } = useChat({
+        transport: {
+            api: '/api/chat',
+        },
+        onData: (data) => {
+            // Handle artifact data messages
+            if (data.type === 'artifact') {
+                setArtifacts(prev => [...prev, data.artifact]);
+            }
+        },
+    });
+
+    return (
+        <div>
+            {/* Display artifacts */}
+            <div className="artifacts">
+                {artifacts.map((artifact, i) => (
+                    artifact.mime_type.startsWith('image/') && (
+                        <img
+                            key={artifact.id || i}
+                            src={`data:${artifact.mime_type};base64,${artifact.data}`}
+                            alt={`Generated artifact ${i + 1}`}
+                        />
+                    )
+                ))}
+            </div>
+
+            {/* Messages display */}
+            <div>
+                {messages.map(m => (
+                    <div key={m.id}>
+                        <strong>{m.role}:</strong>{' '}
+                        {m.parts
+                            .filter(part => part.type === 'text')
+                            .map(part => part.text)
+                            .join('')}
+                    </div>
+                ))}
+            </div>
+
+            <form onSubmit={(e) => {
+                e.preventDefault();
+                if (input.trim() && status === 'ready') {
+                    sendMessage(input);
+                    setInput('');
+                }
+            }}>
+                <input
+                    value={input}
+                    placeholder="Ask to generate an image..."
+                    onChange={(e) => setInput(e.target.value)}
+                />
+                <button type="submit">Send</button>
+            </form>
+        </div>
+    );
+}
+```
+
+### Artifact Events with Broadcasting
+
+When using `asBroadcast()` for WebSocket broadcasting, listen for the `.artifact` event:
+
+```javascript
+useEcho(`chat.${sessionId}`, {
+    '.artifact': (data) => {
+        console.log('Artifact received:', data.tool_name);
+
+        // Store or display the artifact
+        if (data.artifact.mime_type.startsWith('image/')) {
+            setImages(prev => [...prev, {
+                id: data.artifact.id,
+                src: `data:${data.artifact.mime_type};base64,${data.artifact.data}`,
+                metadata: data.artifact.metadata,
+            }]);
+        }
+    },
+
+    '.tool_result': (data) => {
+        console.log('Tool result (text for LLM):', data.result);
+    },
+
+    // ... other event handlers
+});
+```
+
+### Persisting Artifacts in Callbacks
+
+Use streaming callbacks to save artifacts to your database or storage:
 
 ```php
 use Illuminate\Support\Collection;
-use Prism\Prism\Contracts\Message;
+use Prism\Prism\Streaming\Events\ArtifactEvent;
+use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Text\PendingRequest;
-use Prism\Prism\ValueObjects\Messages\AssistantMessage;
-use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 
 return Prism::text()
     ->using('anthropic', 'claude-3-7-sonnet')
-    ->withTools([$weatherTool])
+    ->withTools([$imageGeneratorTool])
     ->withPrompt(request('message'))
-    ->onComplete(function (PendingRequest $request, Collection $messages) use ($conversationId) {
-        foreach ($messages as $message) {
-            if ($message instanceof AssistantMessage) {
-                // Save the assistant's text response
-                ConversationMessage::create([
+    ->asDataStreamResponse(function (PendingRequest $request, Collection $events) use ($conversationId) {
+        // Save artifacts to storage
+        $events
+            ->filter(fn (StreamEvent $event) => $event instanceof ArtifactEvent)
+            ->each(function (ArtifactEvent $event) use ($conversationId) {
+                Attachment::create([
                     'conversation_id' => $conversationId,
-                    'role' => 'assistant',
-                    'content' => $message->content,
-                    'tool_calls' => $message->toolCalls,
+                    'tool_call_id' => $event->toolCallId,
+                    'tool_name' => $event->toolName,
+                    'mime_type' => $event->artifact->mimeType,
+                    'data' => $event->artifact->rawContent(), // Decoded binary data
+                    'metadata' => $event->artifact->metadata,
                 ]);
-            }
-
-            if ($message instanceof ToolResultMessage) {
-                // Save tool execution results
-                foreach ($message->toolResults as $toolResult) {
-                    ConversationMessage::create([
-                        'conversation_id' => $conversationId,
-                        'role' => 'tool',
-                        'content' => json_encode($toolResult->result),
-                        'tool_name' => $toolResult->toolName,
-                        'tool_call_id' => $toolResult->toolCallId,
-                    ]);
-                }
-            }
-        }
-    })
-    ->asEventStreamResponse();
+            });
+    });
 ```
 
-#### Using Invokable Classes
+For more information about creating tools that produce artifacts, see [Tool Artifacts](/core-concepts/tools-function-calling#tool-artifacts).
 
-For better organization, you can use invokable classes as callbacks:
+## Advanced Usage
+
+### Handling Completion with Callbacks
+
+Need to save a conversation to your database after the AI finishes responding? Pass a callback directly to your terminal method to handle the completed response. This is perfect for persisting conversations, tracking analytics, or logging AI interactions.
+
+#### Text Generation Callbacks
+
+For non-streaming requests, pass a callback to `asText()`:
+
+```php
+use Prism\Prism\Text\PendingRequest;
+use Prism\Prism\Text\Response;
+
+$response = Prism::text()
+    ->using('anthropic', 'claude-3-7-sonnet')
+    ->withPrompt(request('message'))
+    ->asText(function (PendingRequest $request, Response $response) use ($conversationId) {
+        // Save the response to your database
+        ConversationMessage::create([
+            'conversation_id' => $conversationId,
+            'role' => 'assistant',
+            'content' => $response->text,
+            'tool_calls' => $response->toolCalls,
+        ]);
+    });
+
+// The response is still returned for further use
+return response()->json(['message' => $response->text]);
+```
+
+The callback receives the `PendingRequest` and the complete `Response` object, giving you access to the full response including text, tool calls, tool results, and usage statistics.
+
+#### Streaming Response Callbacks
+
+For streaming responses, pass a callback to receive all collected events when the stream completes:
 
 ```php
 use Illuminate\Support\Collection;
+use Prism\Prism\Streaming\Events\StreamEvent;
+use Prism\Prism\Streaming\Events\TextDeltaEvent;
 use Prism\Prism\Text\PendingRequest;
-use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 
-class SaveConversation
+return Prism::text()
+    ->using('anthropic', 'claude-3-7-sonnet')
+    ->withPrompt(request('message'))
+    ->asEventStreamResponse(function (PendingRequest $request, Collection $events) use ($conversationId) {
+        // Reconstruct the full text from all delta events
+        $fullText = $events
+            ->filter(fn (StreamEvent $event) => $event instanceof TextDeltaEvent)
+            ->map(fn (TextDeltaEvent $event) => $event->delta)
+            ->join('');
+
+        // Save the complete response
+        ConversationMessage::create([
+            'conversation_id' => $conversationId,
+            'role' => 'assistant',
+            'content' => $fullText,
+        ]);
+    });
+```
+
+The callback receives:
+- `PendingRequest` - The original request configuration
+- `Collection<StreamEvent>` - All events that occurred during the stream
+
+This works with all streaming methods: `asEventStreamResponse()`, `asDataStreamResponse()`, and `asBroadcast()`.
+
+#### Using Invokable Classes
+
+For better organization, use invokable classes as callbacks:
+
+```php
+use Illuminate\Support\Collection;
+use Prism\Prism\Streaming\Events\StreamEvent;
+use Prism\Prism\Streaming\Events\TextDeltaEvent;
+use Prism\Prism\Text\PendingRequest;
+
+class SaveStreamedConversation
 {
     public function __construct(
         protected string $conversationId
     ) {}
 
-    public function __invoke(PendingRequest $request, Collection $messages): void
+    public function __invoke(PendingRequest $request, Collection $events): void
     {
-        foreach ($messages as $message) {
-            if ($message instanceof AssistantMessage) {
-                ConversationMessage::create([
-                    'conversation_id' => $this->conversationId,
-                    'role' => 'assistant',
-                    'content' => $message->content,
-                    'tool_calls' => $message->toolCalls,
-                ]);
-            }
-        }
+        $fullText = $events
+            ->filter(fn (StreamEvent $event) => $event instanceof TextDeltaEvent)
+            ->map(fn (TextDeltaEvent $event) => $event->delta)
+            ->join('');
+
+        ConversationMessage::create([
+            'conversation_id' => $this->conversationId,
+            'role' => 'assistant',
+            'content' => $fullText,
+        ]);
     }
 }
+
+// Use with streaming responses
+return Prism::text()
+    ->using('anthropic', 'claude-3-7-sonnet')
+    ->withPrompt($message)
+    ->asEventStreamResponse(new SaveStreamedConversation($conversationId));
 ```
 
 ### Custom Event Processing

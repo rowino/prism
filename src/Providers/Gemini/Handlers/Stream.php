@@ -17,6 +17,7 @@ use Prism\Prism\Providers\Gemini\Maps\MessageMap;
 use Prism\Prism\Providers\Gemini\Maps\ToolChoiceMap;
 use Prism\Prism\Providers\Gemini\Maps\ToolMap;
 use Prism\Prism\Streaming\EventID;
+use Prism\Prism\Streaming\Events\ArtifactEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\StreamStartEvent;
@@ -33,6 +34,7 @@ use Prism\Prism\Text\Request;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolOutput;
 use Prism\Prism\ValueObjects\ToolResult;
 use Prism\Prism\ValueObjects\Usage;
 use Psr\Http\Message\StreamInterface;
@@ -121,6 +123,8 @@ class Stream
                 // Check if this is the final part of the tool calls
                 if ($this->mapFinishReason($data) === FinishReason::ToolCalls) {
                     yield from $this->handleToolCalls($request, $depth, $data);
+
+                    return;
                 }
 
                 continue;
@@ -183,11 +187,9 @@ class Stream
                 }
             }
 
-            // Handle completion
             $finishReason = $this->mapFinishReason($data);
 
             if ($finishReason !== FinishReason::Unknown) {
-                // Emit thinking complete if we had thinking
                 if ($this->state->reasoningId() !== '') {
                     yield new ThinkingCompleteEvent(
                         id: EventID::generate(),
@@ -196,7 +198,6 @@ class Stream
                     );
                 }
 
-                // Emit text complete if we had text
                 if ($this->state->hasTextStarted()) {
                     yield new TextCompleteEvent(
                         id: EventID::generate(),
@@ -205,24 +206,29 @@ class Stream
                     );
                 }
 
-                // Extract grounding metadata if available
-                $groundingMetadata = $this->extractGroundingMetadata($data);
-
-                // Emit stream end event
-                yield new StreamEndEvent(
-                    id: EventID::generate(),
-                    timestamp: time(),
-                    finishReason: $finishReason,
-                    usage: $this->state->usage(),
-                    additionalContent: $groundingMetadata !== null ? ['grounding_metadata' => $groundingMetadata] : []
-                );
+                $this->state->withFinishReason($finishReason);
+                $this->state->withMetadata([
+                    'grounding_metadata' => $this->extractGroundingMetadata($data),
+                ]);
             }
         }
 
-        // Handle tool calls if present and not already handled
-        if ($this->state->hasToolCalls() && $this->mapFinishReason([]) === FinishReason::Unknown) {
+        if ($this->state->hasToolCalls()) {
             yield from $this->handleToolCalls($request, $depth);
+
+            return;
         }
+
+        yield new StreamEndEvent(
+            id: EventID::generate(),
+            timestamp: time(),
+            finishReason: $this->state->finishReason() ?? FinishReason::Stop,
+            usage: $this->state->usage(),
+            additionalContent: Arr::whereNotNull([
+                'grounding_metadata' => $this->state->metadata()['grounding_metadata'] ?? null,
+                'thoughtSummaries' => $this->state->thinkingSummaries() === [] ? null : $this->state->thinkingSummaries(),
+            ])
+        );
     }
 
     /**
@@ -291,13 +297,18 @@ class Stream
         foreach ($mappedToolCalls as $toolCall) {
             try {
                 $tool = $this->resolveTool($toolCall->name, $request->tools());
-                $result = call_user_func_array($tool->handle(...), $toolCall->arguments());
+                $output = call_user_func_array($tool->handle(...), $toolCall->arguments());
+
+                if (is_string($output)) {
+                    $output = new ToolOutput(result: $output);
+                }
 
                 $toolResult = new ToolResult(
                     toolCallId: $toolCall->id,
                     toolName: $toolCall->name,
                     args: $toolCall->arguments(),
-                    result: is_array($result) ? $result : ['result' => $result]
+                    result: is_array($output->result) ? $output->result : ['result' => $output->result],
+                    artifacts: $output->artifacts,
                 );
 
                 $toolResults[] = $toolResult;
@@ -309,6 +320,17 @@ class Stream
                     messageId: $this->state->messageId(),
                     success: true
                 );
+
+                foreach ($toolResult->artifacts as $artifact) {
+                    yield new ArtifactEvent(
+                        id: EventID::generate(),
+                        timestamp: time(),
+                        artifact: $artifact,
+                        toolCallId: $toolCall->id,
+                        toolName: $toolCall->name,
+                        messageId: $this->state->messageId(),
+                    );
+                }
             } catch (Throwable $e) {
                 $errorResult = new ToolResult(
                     toolCallId: $toolCall->id,
@@ -330,16 +352,26 @@ class Stream
             }
         }
 
-        // Add messages for next turn and continue streaming
         if ($toolResults !== []) {
             $request->addMessage(new AssistantMessage($this->state->currentText(), $mappedToolCalls));
             $request->addMessage(new ToolResultMessage($toolResults));
 
             $depth++;
             if ($depth < $request->maxSteps()) {
+                $previousUsage = $this->state->usage();
                 $this->state->reset();
                 $nextResponse = $this->sendRequest($request);
                 yield from $this->processStream($nextResponse, $request, $depth);
+
+                if ($previousUsage instanceof \Prism\Prism\ValueObjects\Usage && $this->state->usage() instanceof \Prism\Prism\ValueObjects\Usage) {
+                    $this->state->withUsage(new Usage(
+                        promptTokens: $previousUsage->promptTokens + $this->state->usage()->promptTokens,
+                        completionTokens: $previousUsage->completionTokens + $this->state->usage()->completionTokens,
+                        cacheWriteInputTokens: ($previousUsage->cacheWriteInputTokens ?? 0) + ($this->state->usage()->cacheWriteInputTokens ?? 0),
+                        cacheReadInputTokens: ($previousUsage->cacheReadInputTokens ?? 0) + ($this->state->usage()->cacheReadInputTokens ?? 0),
+                        thoughtTokens: ($previousUsage->thoughtTokens ?? 0) + ($this->state->usage()->thoughtTokens ?? 0)
+                    ));
+                }
             }
         }
     }
@@ -431,14 +463,12 @@ class Stream
         $tools = [];
 
         if ($request->providerTools() !== []) {
-            $tools = [
-                Arr::mapWithKeys(
-                    $request->providerTools(),
-                    fn ($providerTool): array => [
-                        $providerTool->type => $providerTool->options !== [] ? $providerTool->options : (object) [],
-                    ]
-                ),
-            ];
+            $tools = array_map(
+                fn ($providerTool): array => [
+                    $providerTool->type => $providerTool->options !== [] ? $providerTool->options : (object) [],
+                ],
+                $request->providerTools()
+            );
         } elseif ($providerOptions['searchGrounding'] ?? false) {
             $tools = [
                 [
@@ -465,7 +495,8 @@ class Stream
             ];
         }
 
-        return $this->client
+        /** @var Response $response */
+        $response = $this->client
             ->withOptions(['stream' => true])
             ->post(
                 "{$request->model()}:streamGenerateContent?alt=sse",
@@ -483,6 +514,8 @@ class Stream
                     'safetySettings' => $providerOptions['safetySettings'] ?? null,
                 ])
             );
+
+        return $response;
     }
 
     protected function readLine(StreamInterface $stream): string

@@ -146,6 +146,7 @@ class Structured
                 id: data_get($data, 'id'),
                 model: data_get($data, 'model'),
                 rateLimits: $this->processRateLimits($clientResponse),
+                serviceTier: data_get($data, 'service_tier'),
             ),
             messages: $request->messages(),
             systemPrompts: $request->systemPrompts(),
@@ -187,13 +188,14 @@ class Structured
      */
     protected function sendRequest(Request $request, array $responseFormat): ClientResponse
     {
-        return $this->client->post(
+        /** @var ClientResponse $response */
+        $response = $this->client->post(
             'responses',
             array_merge([
                 'model' => $request->model(),
                 'input' => (new MessageMap($request->messages(), $request->systemPrompts()))(),
-                'max_output_tokens' => $request->maxTokens(),
             ], Arr::whereNotNull([
+                'max_output_tokens' => $request->maxTokens(),
                 'temperature' => $request->temperature(),
                 'top_p' => $request->topP(),
                 'metadata' => $request->providerOptions('metadata'),
@@ -204,11 +206,14 @@ class Structured
                 'service_tier' => $request->providerOptions('service_tier'),
                 'truncation' => $request->providerOptions('truncation'),
                 'reasoning' => $request->providerOptions('reasoning'),
+                'store' => $request->providerOptions('store'),
                 'text' => [
                     'format' => $responseFormat,
                 ],
             ]))
         );
+
+        return $response;
     }
 
     protected function handleAutoMode(Request $request): ClientResponse

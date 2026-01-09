@@ -20,6 +20,7 @@ use Prism\Prism\Providers\DeepSeek\Maps\MessageMap;
 use Prism\Prism\Providers\DeepSeek\Maps\ToolChoiceMap;
 use Prism\Prism\Providers\DeepSeek\Maps\ToolMap;
 use Prism\Prism\Streaming\EventID;
+use Prism\Prism\Streaming\Events\ArtifactEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\StreamStartEvent;
@@ -198,20 +199,27 @@ class Stream
                     );
                 }
 
-                $usage = $this->extractUsage($data);
+                $this->state->withFinishReason($finishReason);
 
-                yield new StreamEndEvent(
-                    id: EventID::generate(),
-                    timestamp: time(),
-                    finishReason: $finishReason,
-                    usage: $usage
-                );
+                $usage = $this->extractUsage($data);
+                if ($usage instanceof \Prism\Prism\ValueObjects\Usage) {
+                    $this->state->addUsage($usage);
+                }
             }
         }
 
         if ($toolCalls !== []) {
             yield from $this->handleToolCalls($request, $text, $toolCalls, $depth);
+
+            return;
         }
+
+        yield new StreamEndEvent(
+            id: EventID::generate(),
+            timestamp: time(),
+            finishReason: $this->state->finishReason() ?? FinishReason::Stop,
+            usage: $this->state->usage()
+        );
     }
 
     /**
@@ -357,6 +365,17 @@ class Stream
                 toolResult: $result,
                 messageId: $this->state->messageId()
             );
+
+            foreach ($result->artifacts as $artifact) {
+                yield new ArtifactEvent(
+                    id: EventID::generate(),
+                    timestamp: time(),
+                    artifact: $artifact,
+                    toolCallId: $result->toolCallId,
+                    toolName: $result->toolName,
+                    messageId: $this->state->messageId(),
+                );
+            }
         }
 
         $request->addMessage(new AssistantMessage($text, $mappedToolCalls));
@@ -387,7 +406,8 @@ class Stream
      */
     protected function sendRequest(Request $request): Response
     {
-        return $this->client->post(
+        /** @var Response $response */
+        $response = $this->client->post(
             'chat/completions',
             array_merge([
                 'stream' => true,
@@ -401,6 +421,8 @@ class Stream
                 'tool_choice' => ToolChoiceMap::map($request->toolChoice()),
             ]))
         );
+
+        return $response;
     }
 
     protected function readLine(StreamInterface $stream): string

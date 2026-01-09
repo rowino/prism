@@ -4,6 +4,7 @@ namespace Prism\Prism\ValueObjects\Media;
 
 use finfo;
 use Illuminate\Filesystem\FilesystemAdapter;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
@@ -256,8 +257,6 @@ class Media
     }
 
     /**
-     * Get a file resource suitable for HTTP multipart uploads
-     *
      * @return resource
      */
     public function resource()
@@ -290,7 +289,9 @@ class Media
             return;
         }
 
-        $content = Http::get($this->url)->body();
+        /** @var Response */
+        $response = Http::get($this->url);
+        $content = $response->body();
 
         if (! $content) {
             throw new InvalidArgumentException("{$this->url} returns no content.");

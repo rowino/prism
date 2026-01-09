@@ -90,7 +90,7 @@ class Text
                         : config('prism.anthropic.default_thinking_budget', 1024),
                 ]
                 : null,
-            'max_tokens' => $request->maxTokens(),
+            'max_tokens' => $request->maxTokens() ?? 64000,
             'temperature' => $request->temperature(),
             'top_p' => $request->topP(),
             'tools' => static::buildTools($request) ?: null,
@@ -190,6 +190,7 @@ class Text
             fn (ProviderTool $tool): array => [
                 'type' => $tool->type,
                 'name' => $tool->name,
+                ...$tool->options,
             ],
             $request->providerTools()
         );

@@ -20,6 +20,7 @@ use Prism\Prism\Providers\XAI\Maps\MessageMap;
 use Prism\Prism\Providers\XAI\Maps\ToolChoiceMap;
 use Prism\Prism\Providers\XAI\Maps\ToolMap;
 use Prism\Prism\Streaming\EventID;
+use Prism\Prism\Streaming\Events\ArtifactEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\StreamStartEvent;
@@ -165,7 +166,14 @@ class Stream
             $rawFinishReason = data_get($data, 'choices.0.finish_reason');
             if ($rawFinishReason !== null) {
                 $finishReason = $this->extractFinishReason($data);
+                if ($finishReason instanceof \Prism\Prism\Enums\FinishReason) {
+                    $this->state->withFinishReason($finishReason);
+                }
+
                 $usage = $this->extractUsage($data);
+                if ($usage instanceof \Prism\Prism\ValueObjects\Usage) {
+                    $this->state->addUsage($usage);
+                }
             }
         }
 
@@ -194,8 +202,8 @@ class Stream
         yield new StreamEndEvent(
             id: EventID::generate(),
             timestamp: time(),
-            finishReason: $finishReason ?? FinishReason::Stop,
-            usage: $usage
+            finishReason: $this->state->finishReason() ?? FinishReason::Stop,
+            usage: $this->state->usage()
         );
     }
 
@@ -344,6 +352,17 @@ class Stream
                 toolResult: $result,
                 messageId: $this->state->messageId()
             );
+
+            foreach ($result->artifacts as $artifact) {
+                yield new ArtifactEvent(
+                    id: EventID::generate(),
+                    timestamp: time(),
+                    artifact: $artifact,
+                    toolCallId: $result->toolCallId,
+                    toolName: $result->toolName,
+                    messageId: $this->state->messageId(),
+                );
+            }
         }
 
         $request->addMessage(new AssistantMessage($text, $mappedToolCalls));
@@ -372,7 +391,8 @@ class Stream
 
     protected function sendRequest(Request $request): Response
     {
-        return $this->client
+        /** @var Response $response */
+        $response = $this->client
             ->withOptions(['stream' => true])
             ->post(
                 'chat/completions',
@@ -388,6 +408,8 @@ class Stream
                     'tool_choice' => ToolChoiceMap::map($request->toolChoice()),
                 ]))
             );
+
+        return $response;
     }
 
     protected function readLine(StreamInterface $stream): string

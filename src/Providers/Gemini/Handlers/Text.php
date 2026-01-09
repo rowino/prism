@@ -77,17 +77,17 @@ class Text
         $thinkingConfig = $providerOptions['thinkingConfig'] ?? null;
 
         if (isset($providerOptions['thinkingBudget'])) {
-            $thinkingConfig = [
+            $thinkingConfig = Arr::whereNotNull([
                 'thinkingBudget' => $providerOptions['thinkingBudget'],
-                'includeThoughts' => true,
-            ];
+                'includeThoughts' => $providerOptions['includeThoughts'] ?? null,
+            ]);
         }
 
         if (isset($providerOptions['thinkingLevel'])) {
-            $thinkingConfig = [
+            $thinkingConfig = Arr::whereNotNull([
                 'thinkingLevel' => $providerOptions['thinkingLevel'],
-                'includeThoughts' => true,
-            ];
+                'includeThoughts' => $providerOptions['includeThoughts'] ?? null,
+            ]);
         }
 
         $generationConfig = Arr::whereNotNull([
@@ -104,21 +104,20 @@ class Text
         $tools = [];
 
         if ($request->providerTools() !== []) {
-            $tools = [
-                Arr::mapWithKeys(
-                    $request->providerTools(),
-                    fn (ProviderTool $providerTool): array => [
-                        $providerTool->type => $providerTool->options !== [] ? $providerTool->options : (object) [],
-                    ]
-                ),
-            ];
+            $tools = array_map(
+                fn (ProviderTool $providerTool): array => [
+                    $providerTool->type => $providerTool->options !== [] ? $providerTool->options : (object) [],
+                ],
+                $request->providerTools()
+            );
         }
 
         if ($request->tools() !== []) {
             $tools['function_declarations'] = ToolMap::map($request->tools());
         }
 
-        return $this->client->post(
+        /** @var ClientResponse $response */
+        $response = $this->client->post(
             "{$request->model()}:generateContent",
             Arr::whereNotNull([
                 ...(new MessageMap($request->messages(), $request->systemPrompts()))(),
@@ -129,6 +128,8 @@ class Text
                 'safetySettings' => $providerOptions['safetySettings'] ?? null,
             ])
         );
+
+        return $response;
     }
 
     /**
@@ -193,7 +194,7 @@ class Text
             ),
             meta: new Meta(
                 id: data_get($data, 'id', ''),
-                model: data_get($data, 'modelVersion'),
+                model: data_get($data, 'modelVersion', ''),
             ),
             messages: $request->messages(),
             systemPrompts: $request->systemPrompts(),
@@ -201,6 +202,7 @@ class Text
                 'citations' => CitationMapper::mapFromGemini(data_get($data, 'candidates.0', [])) ?: null,
                 'searchEntryPoint' => data_get($data, 'candidates.0.groundingMetadata.searchEntryPoint'),
                 'searchQueries' => data_get($data, 'candidates.0.groundingMetadata.webSearchQueries'),
+                'urlMetadata' => data_get($data, 'candidates.0.urlContextMetadata.urlMetadata'),
                 'thoughtSummaries' => $thoughtSummaries !== [] ? $thoughtSummaries : null,
             ]),
         ));

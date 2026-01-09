@@ -17,6 +17,7 @@ use Prism\Prism\Providers\Ollama\Maps\MessageMap;
 use Prism\Prism\Providers\Ollama\Maps\ToolMap;
 use Prism\Prism\Providers\Ollama\ValueObjects\OllamaStreamState;
 use Prism\Prism\Streaming\EventID;
+use Prism\Prism\Streaming\Events\ArtifactEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\StreamStartEvent;
@@ -66,7 +67,10 @@ class Stream
             throw new PrismException('Maximum tool call chain depth exceeded');
         }
 
-        $this->state->reset();
+        if ($depth === 0) {
+            $this->state->reset();
+        }
+
         $text = '';
 
         while (! $response->getBody()->eof()) {
@@ -271,6 +275,17 @@ class Stream
                 messageId: $this->state->messageId(),
                 success: true
             );
+
+            foreach ($result->artifacts as $artifact) {
+                yield new ArtifactEvent(
+                    id: EventID::generate(),
+                    timestamp: time(),
+                    artifact: $artifact,
+                    toolCallId: $result->toolCallId,
+                    toolName: $result->toolName,
+                    messageId: $this->state->messageId(),
+                );
+            }
         }
 
         // Add messages for next turn
@@ -280,6 +295,7 @@ class Stream
         // Continue streaming if within step limit
         $depth++;
         if ($depth < $request->maxSteps()) {
+            $this->state->reset();
             $nextResponse = $this->sendRequest($request);
             yield from $this->processStream($nextResponse, $request, $depth);
         }
@@ -295,7 +311,8 @@ class Stream
 
     protected function sendRequest(Request $request): Response
     {
-        return $this
+        /** @var Response $response */
+        $response = $this
             ->client
             ->withOptions(['stream' => true])
             ->post('api/chat', [
@@ -316,6 +333,8 @@ class Stream
                     'top_p' => $request->topP(),
                 ], $request->providerOptions())),
             ]);
+
+        return $response;
     }
 
     protected function readLine(StreamInterface $stream): string
