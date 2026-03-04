@@ -16,7 +16,8 @@ use Prism\Prism\Providers\OpenRouter\Concerns\MapsFinishReason;
 use Prism\Prism\Providers\OpenRouter\Concerns\ValidatesResponses;
 use Prism\Prism\Providers\OpenRouter\Maps\MessageMap;
 use Prism\Prism\Streaming\EventID;
-use Prism\Prism\Streaming\Events\ArtifactEvent;
+use Prism\Prism\Streaming\Events\StepFinishEvent;
+use Prism\Prism\Streaming\Events\StepStartEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\StreamStartEvent;
@@ -27,7 +28,6 @@ use Prism\Prism\Streaming\Events\ThinkingCompleteEvent;
 use Prism\Prism\Streaming\Events\ThinkingEvent;
 use Prism\Prism\Streaming\Events\ThinkingStartEvent;
 use Prism\Prism\Streaming\Events\ToolCallEvent;
-use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Streaming\StreamState;
 use Prism\Prism\Text\Request;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
@@ -93,12 +93,23 @@ class Stream
                 );
             }
 
+            if ($this->state->shouldEmitStepStart()) {
+                $this->state->markStepStarted();
+
+                yield new StepStartEvent(
+                    id: EventID::generate(),
+                    timestamp: time()
+                );
+            }
+
             if ($this->hasToolCalls($data)) {
                 $toolCalls = $this->extractToolCalls($data, $toolCalls);
 
                 $finishReason = data_get($data, 'choices.0.finish_reason');
                 if ($finishReason !== null && $this->mapFinishReason($data) === FinishReason::ToolCalls) {
                     if ($this->state->hasTextStarted() && $text !== '') {
+                        $this->state->markTextCompleted();
+
                         yield new TextCompleteEvent(
                             id: EventID::generate(),
                             timestamp: time(),
@@ -125,6 +136,8 @@ class Stream
             $finishReasonValue = data_get($data, 'choices.0.finish_reason');
             if ($finishReasonValue !== null && $this->mapFinishReason($data) === FinishReason::ToolCalls) {
                 if ($this->state->hasTextStarted() && $text !== '') {
+                    $this->state->markTextCompleted();
+
                     yield new TextCompleteEvent(
                         id: EventID::generate(),
                         timestamp: time(),
@@ -169,9 +182,9 @@ class Stream
                         delta: $reasoningDelta,
                         reasoningId: $this->state->reasoningId()
                     );
-                }
 
-                continue;
+                    continue;
+                }
             }
 
             $content = $this->extractContentDelta($data);
@@ -201,6 +214,8 @@ class Stream
                 $finishReason = $this->mapFinishReason($data);
 
                 if ($this->state->hasTextStarted() && $text !== '') {
+                    $this->state->markTextCompleted();
+
                     yield new TextCompleteEvent(
                         id: EventID::generate(),
                         timestamp: time(),
@@ -217,19 +232,32 @@ class Stream
                 }
 
                 $this->state->withFinishReason($finishReason);
+            }
 
-                $usage = $this->extractUsage($data);
-                if ($usage instanceof \Prism\Prism\ValueObjects\Usage) {
-                    $this->state->addUsage($usage);
-                }
+            // Extract usage from any chunk that has it
+            // OpenRouter sends usage in a separate final chunk when stream_options.include_usage=true
+            $usage = $this->extractUsage($data);
+            if ($usage instanceof Usage) {
+                $this->state->addUsage($usage);
             }
         }
 
-        yield new StreamEndEvent(
+        $this->state->markStepFinished();
+        yield new StepFinishEvent(
+            id: EventID::generate(),
+            timestamp: time()
+        );
+
+        yield $this->emitStreamEndEvent();
+    }
+
+    protected function emitStreamEndEvent(): StreamEndEvent
+    {
+        return new StreamEndEvent(
             id: EventID::generate(),
             timestamp: time(),
             finishReason: $this->state->finishReason() ?? FinishReason::Stop,
-            usage: $this->state->usage()
+            usage: $this->state->usage() ?? new Usage(0, 0),
         );
     }
 
@@ -360,30 +388,18 @@ class Stream
             );
         }
 
-        $toolResults = $this->callTools($request->tools(), $mappedToolCalls);
+        $toolResults = [];
+        yield from $this->callToolsAndYieldEvents($request->tools(), $mappedToolCalls, $this->state->messageId(), $toolResults);
 
-        foreach ($toolResults as $result) {
-            yield new ToolResultEvent(
-                id: EventID::generate(),
-                timestamp: time(),
-                toolResult: $result,
-                messageId: $this->state->messageId()
-            );
-
-            foreach ($result->artifacts as $artifact) {
-                yield new ArtifactEvent(
-                    id: EventID::generate(),
-                    timestamp: time(),
-                    artifact: $artifact,
-                    toolCallId: $result->toolCallId,
-                    toolName: $result->toolName,
-                    messageId: $this->state->messageId(),
-                );
-            }
-        }
+        $this->state->markStepFinished();
+        yield new StepFinishEvent(
+            id: EventID::generate(),
+            timestamp: time()
+        );
 
         $request->addMessage(new AssistantMessage($text, $mappedToolCalls));
         $request->addMessage(new ToolResultMessage($toolResults));
+        $request->resetToolChoice();
 
         $this->state
             ->resetTextState()
@@ -394,6 +410,8 @@ class Stream
         if ($depth < $request->maxSteps()) {
             $nextResponse = $this->sendRequest($request);
             yield from $this->processStream($nextResponse, $request, $depth);
+        } else {
+            yield $this->emitStreamEndEvent();
         }
     }
 
@@ -424,7 +442,7 @@ class Stream
                     $arguments,
                 );
             })
-            ->toArray();
+            ->all();
     }
 
     protected function sendRequest(Request $request): Response

@@ -17,7 +17,8 @@ use Prism\Prism\Providers\Ollama\Maps\MessageMap;
 use Prism\Prism\Providers\Ollama\Maps\ToolMap;
 use Prism\Prism\Providers\Ollama\ValueObjects\OllamaStreamState;
 use Prism\Prism\Streaming\EventID;
-use Prism\Prism\Streaming\Events\ArtifactEvent;
+use Prism\Prism\Streaming\Events\StepFinishEvent;
+use Prism\Prism\Streaming\Events\StepStartEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\StreamStartEvent;
@@ -28,7 +29,6 @@ use Prism\Prism\Streaming\Events\ThinkingCompleteEvent;
 use Prism\Prism\Streaming\Events\ThinkingEvent;
 use Prism\Prism\Streaming\Events\ThinkingStartEvent;
 use Prism\Prism\Streaming\Events\ToolCallEvent;
-use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Text\Request;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
@@ -89,6 +89,16 @@ class Stream
                     provider: 'ollama'
                 );
                 $this->state->markStreamStarted()->withMessageId(EventID::generate());
+            }
+
+            // Emit step start event once per step
+            if ($this->state->shouldEmitStepStart()) {
+                $this->state->markStepStarted();
+
+                yield new StepStartEvent(
+                    id: EventID::generate(),
+                    timestamp: time()
+                );
             }
 
             // Accumulate token counts
@@ -163,6 +173,8 @@ class Stream
             if ((bool) data_get($data, 'done', false) && $this->state->hasToolCalls()) {
                 // Emit text complete if we had text content
                 if ($this->state->hasTextStarted()) {
+                    $this->state->markTextCompleted();
+
                     yield new TextCompleteEvent(
                         id: EventID::generate(),
                         timestamp: time(),
@@ -179,6 +191,8 @@ class Stream
             if ((bool) data_get($data, 'done', false)) {
                 // Emit text complete if we had text content
                 if ($this->state->hasTextStarted()) {
+                    $this->state->markTextCompleted();
+
                     yield new TextCompleteEvent(
                         id: EventID::generate(),
                         timestamp: time(),
@@ -186,20 +200,32 @@ class Stream
                     );
                 }
 
-                // Emit stream end event with usage
-                yield new StreamEndEvent(
+                // Emit step finish before stream end
+                $this->state->markStepFinished();
+                yield new StepFinishEvent(
                     id: EventID::generate(),
-                    timestamp: time(),
-                    finishReason: FinishReason::Stop,
-                    usage: new Usage(
-                        promptTokens: $this->state->promptTokens(),
-                        completionTokens: $this->state->completionTokens()
-                    )
+                    timestamp: time()
                 );
+
+                // Emit stream end event with usage
+                yield $this->emitStreamEndEvent();
 
                 return;
             }
         }
+    }
+
+    protected function emitStreamEndEvent(): StreamEndEvent
+    {
+        return new StreamEndEvent(
+            id: EventID::generate(),
+            timestamp: time(),
+            finishReason: FinishReason::Stop,
+            usage: new Usage(
+                promptTokens: $this->state->promptTokens(),
+                completionTokens: $this->state->completionTokens()
+            )
+        );
     }
 
     /**
@@ -265,32 +291,20 @@ class Stream
         }
 
         // Execute tools and emit results
-        $toolResults = $this->callTools($request->tools(), $mappedToolCalls);
+        $toolResults = [];
+        yield from $this->callToolsAndYieldEvents($request->tools(), $mappedToolCalls, $this->state->messageId(), $toolResults);
 
-        foreach ($toolResults as $result) {
-            yield new ToolResultEvent(
-                id: EventID::generate(),
-                timestamp: time(),
-                toolResult: $result,
-                messageId: $this->state->messageId(),
-                success: true
-            );
-
-            foreach ($result->artifacts as $artifact) {
-                yield new ArtifactEvent(
-                    id: EventID::generate(),
-                    timestamp: time(),
-                    artifact: $artifact,
-                    toolCallId: $result->toolCallId,
-                    toolName: $result->toolName,
-                    messageId: $this->state->messageId(),
-                );
-            }
-        }
+        // Emit step finish after tool calls
+        $this->state->markStepFinished();
+        yield new StepFinishEvent(
+            id: EventID::generate(),
+            timestamp: time()
+        );
 
         // Add messages for next turn
         $request->addMessage(new AssistantMessage($text, $mappedToolCalls));
         $request->addMessage(new ToolResultMessage($toolResults));
+        $request->resetToolChoice();
 
         // Continue streaming if within step limit
         $depth++;
@@ -298,6 +312,8 @@ class Stream
             $this->state->reset();
             $nextResponse = $this->sendRequest($request);
             yield from $this->processStream($nextResponse, $request, $depth);
+        } else {
+            yield $this->emitStreamEndEvent();
         }
     }
 

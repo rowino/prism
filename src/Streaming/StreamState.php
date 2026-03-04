@@ -16,6 +16,8 @@ class StreamState
 
     protected bool $streamStarted = false;
 
+    protected bool $stepStarted = false;
+
     protected bool $textStarted = false;
 
     protected bool $thinkingStarted = false;
@@ -95,9 +97,30 @@ class StreamState
         return $this;
     }
 
+    public function markStepStarted(): self
+    {
+        $this->stepStarted = true;
+
+        return $this;
+    }
+
+    public function markStepFinished(): self
+    {
+        $this->stepStarted = false;
+
+        return $this;
+    }
+
     public function markTextStarted(): self
     {
         $this->textStarted = true;
+
+        return $this;
+    }
+
+    public function markTextCompleted(): self
+    {
+        $this->textStarted = false;
 
         return $this;
     }
@@ -204,7 +227,7 @@ class StreamState
 
     public function addUsage(Usage $usage): self
     {
-        if (! $this->usage instanceof \Prism\Prism\ValueObjects\Usage) {
+        if (! $this->usage instanceof Usage) {
             $this->usage = $usage;
 
             return $this;
@@ -333,6 +356,11 @@ class StreamState
     public function shouldEmitStreamStart(): bool
     {
         return ! $this->streamStarted;
+    }
+
+    public function shouldEmitStepStart(): bool
+    {
+        return ! $this->stepStarted;
     }
 
     public function shouldEmitTextStart(): bool

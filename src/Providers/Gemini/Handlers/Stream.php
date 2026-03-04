@@ -17,7 +17,8 @@ use Prism\Prism\Providers\Gemini\Maps\MessageMap;
 use Prism\Prism\Providers\Gemini\Maps\ToolChoiceMap;
 use Prism\Prism\Providers\Gemini\Maps\ToolMap;
 use Prism\Prism\Streaming\EventID;
-use Prism\Prism\Streaming\Events\ArtifactEvent;
+use Prism\Prism\Streaming\Events\StepFinishEvent;
+use Prism\Prism\Streaming\Events\StepStartEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\StreamStartEvent;
@@ -28,14 +29,11 @@ use Prism\Prism\Streaming\Events\ThinkingCompleteEvent;
 use Prism\Prism\Streaming\Events\ThinkingEvent;
 use Prism\Prism\Streaming\Events\ThinkingStartEvent;
 use Prism\Prism\Streaming\Events\ToolCallEvent;
-use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Streaming\StreamState;
 use Prism\Prism\Text\Request;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolCall;
-use Prism\Prism\ValueObjects\ToolOutput;
-use Prism\Prism\ValueObjects\ToolResult;
 use Prism\Prism\ValueObjects\Usage;
 use Psr\Http\Message\StreamInterface;
 use Throwable;
@@ -45,6 +43,8 @@ class Stream
     use CallsTools;
 
     protected StreamState $state;
+
+    protected ?string $currentThoughtSignature = null;
 
     public function __construct(
         protected PendingRequest $client,
@@ -59,6 +59,7 @@ class Stream
     public function handle(Request $request): Generator
     {
         $this->state->reset();
+        $this->currentThoughtSignature = null;
         $response = $this->sendRequest($request);
 
         yield from $this->processStream($response, $request);
@@ -100,24 +101,39 @@ class Stream
                 $this->state->markStreamStarted();
             }
 
+            // Emit step start event once per step
+            if ($this->state->shouldEmitStepStart()) {
+                $this->state->markStepStarted();
+
+                yield new StepStartEvent(
+                    id: EventID::generate(),
+                    timestamp: time()
+                );
+            }
+
             // Update usage data from each chunk
             $this->state->withUsage($this->extractUsage($data, $request));
 
             // Process tool calls
             if ($this->hasToolCalls($data)) {
+                // Track existing indices before extraction
+                $existingIndices = array_keys($this->state->toolCalls());
+
                 $toolCalls = $this->extractToolCalls($data, $this->state->toolCalls());
                 foreach ($toolCalls as $index => $toolCall) {
                     $this->state->addToolCall($index, $toolCall);
                 }
 
-                // Emit tool call events
-                foreach ($this->state->toolCalls() as $toolCallData) {
-                    yield new ToolCallEvent(
-                        id: EventID::generate(),
-                        timestamp: time(),
-                        toolCall: $this->mapToolCall($toolCallData),
-                        messageId: $this->state->messageId()
-                    );
+                // Emit tool call events only for NEWLY added tool calls
+                foreach ($this->state->toolCalls() as $index => $toolCallData) {
+                    if (! in_array($index, $existingIndices, true)) {
+                        yield new ToolCallEvent(
+                            id: EventID::generate(),
+                            timestamp: time(),
+                            toolCall: $this->mapToolCall($toolCallData),
+                            messageId: $this->state->messageId()
+                        );
+                    }
                 }
 
                 // Check if this is the final part of the tool calls
@@ -199,6 +215,8 @@ class Stream
                 }
 
                 if ($this->state->hasTextStarted()) {
+                    $this->state->markTextCompleted();
+
                     yield new TextCompleteEvent(
                         id: EventID::generate(),
                         timestamp: time(),
@@ -219,11 +237,23 @@ class Stream
             return;
         }
 
-        yield new StreamEndEvent(
+        // Emit step finish before stream end
+        $this->state->markStepFinished();
+        yield new StepFinishEvent(
+            id: EventID::generate(),
+            timestamp: time()
+        );
+
+        yield $this->emitStreamEndEvent();
+    }
+
+    protected function emitStreamEndEvent(): StreamEndEvent
+    {
+        return new StreamEndEvent(
             id: EventID::generate(),
             timestamp: time(),
             finishReason: $this->state->finishReason() ?? FinishReason::Stop,
-            usage: $this->state->usage(),
+            usage: $this->state->usage() ?? new Usage(0, 0),
             additionalContent: Arr::whereNotNull([
                 'grounding_metadata' => $this->state->metadata()['grounding_metadata'] ?? null,
                 'thoughtSummaries' => $this->state->thinkingSummaries() === [] ? null : $this->state->thinkingSummaries(),
@@ -263,13 +293,23 @@ class Stream
     protected function extractToolCalls(array $data, array $toolCalls): array
     {
         $parts = data_get($data, 'candidates.0.content.parts', []);
+        $nextIndex = $toolCalls === [] ? 0 : max(array_keys($toolCalls)) + 1;
 
-        foreach ($parts as $index => $part) {
+        foreach ($parts as $part) {
             if (isset($part['functionCall'])) {
-                $toolCalls[$index]['id'] = EventID::generate('gm');
-                $toolCalls[$index]['name'] = data_get($part, 'functionCall.name');
-                $toolCalls[$index]['arguments'] = data_get($part, 'functionCall.args', []);
-                $toolCalls[$index]['reasoningId'] = data_get($part, 'thoughtSignature');
+                // Capture first thoughtSignature for this response
+                if (isset($part['thoughtSignature'])) {
+                    $this->currentThoughtSignature = $part['thoughtSignature'];
+                }
+
+                $toolCalls[$nextIndex] = [
+                    'id' => EventID::generate('gm'),
+                    'name' => data_get($part, 'functionCall.name'),
+                    'arguments' => data_get($part, 'functionCall.args', []),
+                    // Use part's signature if present, otherwise fall back to stored one
+                    'reasoningId' => $part['thoughtSignature'] ?? $this->currentThoughtSignature,
+                ];
+                $nextIndex++;
             }
         }
 
@@ -294,76 +334,29 @@ class Stream
 
         // Execute tools and emit results
         $toolResults = [];
-        foreach ($mappedToolCalls as $toolCall) {
-            try {
-                $tool = $this->resolveTool($toolCall->name, $request->tools());
-                $output = call_user_func_array($tool->handle(...), $toolCall->arguments());
-
-                if (is_string($output)) {
-                    $output = new ToolOutput(result: $output);
-                }
-
-                $toolResult = new ToolResult(
-                    toolCallId: $toolCall->id,
-                    toolName: $toolCall->name,
-                    args: $toolCall->arguments(),
-                    result: is_array($output->result) ? $output->result : ['result' => $output->result],
-                    artifacts: $output->artifacts,
-                );
-
-                $toolResults[] = $toolResult;
-
-                yield new ToolResultEvent(
-                    id: EventID::generate(),
-                    timestamp: time(),
-                    toolResult: $toolResult,
-                    messageId: $this->state->messageId(),
-                    success: true
-                );
-
-                foreach ($toolResult->artifacts as $artifact) {
-                    yield new ArtifactEvent(
-                        id: EventID::generate(),
-                        timestamp: time(),
-                        artifact: $artifact,
-                        toolCallId: $toolCall->id,
-                        toolName: $toolCall->name,
-                        messageId: $this->state->messageId(),
-                    );
-                }
-            } catch (Throwable $e) {
-                $errorResult = new ToolResult(
-                    toolCallId: $toolCall->id,
-                    toolName: $toolCall->name,
-                    args: $toolCall->arguments(),
-                    result: []
-                );
-
-                $toolResults[] = $errorResult;
-
-                yield new ToolResultEvent(
-                    id: EventID::generate(),
-                    timestamp: time(),
-                    toolResult: $errorResult,
-                    messageId: $this->state->messageId(),
-                    success: false,
-                    error: $e->getMessage()
-                );
-            }
-        }
+        yield from $this->callToolsAndYieldEvents($request->tools(), $mappedToolCalls, $this->state->messageId(), $toolResults);
 
         if ($toolResults !== []) {
+            // Emit step finish after tool calls
+            $this->state->markStepFinished();
+            yield new StepFinishEvent(
+                id: EventID::generate(),
+                timestamp: time()
+            );
+
             $request->addMessage(new AssistantMessage($this->state->currentText(), $mappedToolCalls));
             $request->addMessage(new ToolResultMessage($toolResults));
+            $request->resetToolChoice();
 
             $depth++;
             if ($depth < $request->maxSteps()) {
                 $previousUsage = $this->state->usage();
-                $this->state->reset();
+                $this->state->reset()->withMessageId(EventID::generate());
+                $this->currentThoughtSignature = null;
                 $nextResponse = $this->sendRequest($request);
                 yield from $this->processStream($nextResponse, $request, $depth);
 
-                if ($previousUsage instanceof \Prism\Prism\ValueObjects\Usage && $this->state->usage() instanceof \Prism\Prism\ValueObjects\Usage) {
+                if ($previousUsage instanceof Usage && $this->state->usage() instanceof Usage) {
                     $this->state->withUsage(new Usage(
                         promptTokens: $previousUsage->promptTokens + $this->state->usage()->promptTokens,
                         completionTokens: $previousUsage->completionTokens + $this->state->usage()->completionTokens,
@@ -372,6 +365,8 @@ class Stream
                         thoughtTokens: ($previousUsage->thoughtTokens ?? 0) + ($this->state->usage()->thoughtTokens ?? 0)
                     ));
                 }
+            } else {
+                yield $this->emitStreamEndEvent();
             }
         }
     }
